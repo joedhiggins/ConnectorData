@@ -28,6 +28,7 @@
   --color-error-highlight: #e0ced7;
   --color-warning: #964219;
   --color-warning-highlight: #ddcfc6;
+  --color-maroon: #7a1f2b;
   --radius-sm: 0.375rem;
   --radius-md: 0.5rem;
   --radius-lg: 0.75rem;
@@ -70,6 +71,7 @@
   --color-error-highlight: #4c3d46;
   --color-warning: #bb653b;
   --color-warning-highlight: #564942;
+  --color-maroon: #d9707c;
   --shadow-sm: 0 1px 2px oklch(0 0 0 / 0.2);
   --shadow-md: 0 4px 12px oklch(0 0 0 / 0.3);
   --shadow-lg: 0 12px 32px oklch(0 0 0 / 0.4);
@@ -162,9 +164,8 @@ button { cursor: pointer; background: none; border: none; }
 .card-line { display: flex; justify-content: space-between; align-items: baseline; font-size: var(--text-sm); padding: var(--space-1) 0; border-top: 1px solid var(--color-divider); }
 .card-line:first-child { border-top: none; }
 .card-line-label { color: var(--color-text-muted); font-weight: 500; }
-.card-line-val { font-weight: 600; }
-.card-line-val.na { color: var(--color-text-faint); font-weight: 500; }
-.card-line-val.partial { color: var(--color-warning); }
+.card-line-val { font-weight: 700; }
+.card-line-frac { font-weight: 500; font-size: var(--text-xs); opacity: 0.85; margin-left: 4px; }
 
 .badge { display: inline-flex; align-items: center; padding: 2px var(--space-2); border-radius: var(--radius-full); font-size: var(--text-xs); font-weight: 600; }
 .badge-compatible { background: var(--color-success-highlight); color: var(--color-success); }
@@ -186,6 +187,7 @@ table.data-table th { text-align: left; padding: var(--space-2) var(--space-3); 
 table.data-table td { padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--color-divider); }
 table.data-table tr:hover td { background: var(--color-surface-offset); }
 table.data-table tr.na-row td { color: var(--color-text-faint); }
+.low-trial-count { color: var(--color-maroon); font-weight: 700; }
 
 .tabs { display: flex; gap: var(--space-1); border-bottom: 1px solid var(--color-divider); margin-bottom: var(--space-5); flex-wrap: wrap; }
 .tab-btn { padding: var(--space-2) var(--space-4); font-size: var(--text-sm); font-weight: 600; color: var(--color-text-muted); border-bottom: 2px solid transparent; transition: var(--transition-interactive); }
@@ -198,6 +200,8 @@ table.data-table tr.na-row td { color: var(--color-text-faint); }
 .chip:hover:not(.active) { border-color: var(--color-primary); color: var(--color-text); }
 
 .chart-container { background: var(--color-surface); border: 1px solid var(--color-divider); border-radius: var(--radius-lg); padding: var(--space-4); margin-bottom: var(--space-5); }
+.chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+.chart-subtitle { font-size: var(--text-xs); color: var(--color-text-muted); margin-bottom: var(--space-2); text-align: center; }
 
 .notes-list { display: flex; flex-direction: column; gap: var(--space-2); }
 .note-item { padding: var(--space-3); background: var(--color-surface-offset); border-radius: var(--radius-md); font-size: var(--text-sm); }
@@ -224,14 +228,16 @@ table.data-table tr.na-row td { color: var(--color-text-faint); }
   .mobile-menu-btn { display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: var(--radius-md); border: 1px solid var(--color-border); }
   .main-content { padding: var(--space-4); }
   .compare-select-row { grid-template-columns: 1fr; }
+  .chart-row { grid-template-columns: 1fr; }
   .mobile-nav.open {
     display: flex; flex-direction: column; position: fixed; inset: 0; background: var(--color-bg);
     z-index: 100; padding: var(--space-6); gap: var(--space-4);
   }
 }
 
-.legend-row { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-5); font-size: var(--text-xs); color: var(--color-text-muted); }
+.legend-row { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-5); font-size: var(--text-xs); color: var(--color-text-muted); align-items: center; }
 .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: var(--space-1); vertical-align: middle; }
+.legend-gradient-bar { display: inline-block; width: 90px; height: 10px; border-radius: var(--radius-full); vertical-align: middle; margin: 0 var(--space-2); background: linear-gradient(to right, #c0392b, #e2a13d, #f2d43d, #8ab34d, #3a8f3f); }
 
 .about-content { max-width: 72ch; font-size: var(--text-base); line-height: 1.7; }
 .about-content h3 { margin-top: var(--space-6); margin-bottom: var(--space-2); font-size: var(--text-lg); }

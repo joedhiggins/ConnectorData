@@ -3,7 +3,7 @@ let DATA = null;
 let currentView = 'by-connector';
 let currentConnectorId = null;
 let currentWireType = null;
-let wireViewLevel = 'baseline'; // baseline | 1 | 10 | 100 | 1000
+let wireViewLevel = 'baseline';
 let showNotCompatible = true;
 let cmpA = null, cmpB = null, cmpWire = null;
 let searchQuery = '';
@@ -21,6 +21,22 @@ function fmtCV(v) {
   return `CV ${v}%`;
 }
 function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }
+
+function isDark() { return document.documentElement.getAttribute('data-theme') === 'dark'; }
+
+// gradient: fraction 0.2 (1/5) -> red, 0.6 (3/5) -> yellow, 1.0 (5/5) -> green
+// 0/5 handled separately as bright/deep red
+function gradientColor(tested, possible) {
+  if (tested === 0) {
+    return isDark() ? '#ff5c6a' : '#c0182b'; // bright red, distinct from gradient red
+  }
+  const f = tested / possible;
+  const fClamped = Math.max(0.2, Math.min(1, f));
+  const hue = ((fClamped - 0.2) / 0.8) * 120; // 0=red .. 120=green
+  const light = isDark() ? 62 : 36;
+  const sat = isDark() ? 75 : 68;
+  return `hsl(${hue.toFixed(0)}, ${sat}%, ${light}%)`;
+}
 
 // ===== Theme =====
 (function initTheme() {
@@ -115,9 +131,9 @@ function renderConnectorList() {
       <input type="text" class="search-input" placeholder="Search connectors…" id="connSearch" value="${searchQuery}">
     </div>
     <div class="legend-row">
-      <span><span class="legend-dot" style="background:var(--color-success)"></span>Compatible</span>
-      <span><span class="legend-dot" style="background:var(--color-warning)"></span>Partial coverage</span>
-      <span><span class="legend-dot" style="background:var(--color-text-faint)"></span>Not compatible</span>
+      <span>Wire-type coverage: <span class="legend-gradient-bar"></span></span>
+      <span>0/5 → not compatible</span>
+      <span>5/5 → compatible</span>
     </div>
     <div class="card-grid" id="connGrid"></div>
   `;
@@ -145,13 +161,12 @@ function renderConnectorList() {
       <div class="card-lines">
         ${DATA.awgs.map(awg => {
           const a = c.phase1.by_awg[awg];
+          const color = gradientColor(a.n_wire_types_tested, a.n_wire_types_possible);
           let valEl;
           if (a.compat_status === 'not_compatible') {
-            valEl = `<span class="card-line-val na">Not compatible</span>`;
-          } else if (a.compat_status === 'partial') {
-            valEl = `<span class="card-line-val partial">${fmtOhm(a.mean_ohm)} avg <span style="font-weight:400;font-size:var(--text-xs)">(${a.n_wire_types_tested}/${a.n_wire_types_possible} types)</span></span>`;
+            valEl = `<span class="card-line-val" style="color:${color}">Not compatible <span class="card-line-frac">(0/${a.n_wire_types_possible})</span></span>`;
           } else {
-            valEl = `<span class="card-line-val">${fmtOhm(a.mean_ohm)} avg</span>`;
+            valEl = `<span class="card-line-val" style="color:${color}">${fmtOhm(a.mean_ohm)} avg <span class="card-line-frac">(${a.n_wire_types_tested}/${a.n_wire_types_possible})</span></span>`;
           }
           return `<div class="card-line"><span class="card-line-label">${awg} AWG</span>${valEl}</div>`;
         }).join('')}
@@ -209,19 +224,13 @@ function renderConnectorDetail() {
 
 function renderP1Table(c) {
   const el = $('#p1Table');
-  let rows = '';
-  DATA.awgs.forEach(awg => {
-    const a = c.phase1.by_awg[awg];
-    DATA.wire_order.filter(w => parseInt(w) || w.startsWith(String(awg))).forEach(w => {});
-  });
-  // build rows per fixed wire order, grouped visually by whether tested
   const wireRows = DATA.wire_order.map(w => {
     const awg = parseInt(w.slice(0,2));
     const wd = c.phase1.by_awg[awg]?.by_wire?.[w];
     return { w, awg, wd };
   }).filter(r => r.wd);
 
-  rows = wireRows.map(({w, awg, wd}) => {
+  const rows = wireRows.map(({w, awg, wd}) => {
     const naRow = wd.status === 'not_compatible';
     return `<tr class="${naRow ? 'na-row' : ''}">
       <td>${DATA.wire_labels[w]}</td>
@@ -248,34 +257,67 @@ function renderP2Section(c) {
   }
   const wires = Object.keys(c.phase2);
   el.innerHTML = `<div class="chip-row" id="p2WireChips">${wires.map((w,i) => `<button class="chip ${i===0?'active':''}" data-wire="${w}">${DATA.wire_labels[w] || w}</button>`).join('')}</div>
-  <div class="chart-container"><canvas id="p2Chart" height="90"></canvas></div>`;
+  <div class="chart-row">
+    <div class="chart-container">
+      <div class="chart-subtitle">Connector resistance (preload → load applied → postload → reconnection)</div>
+      <canvas id="p2ChartConn" height="110"></canvas>
+    </div>
+    <div class="chart-container">
+      <div class="chart-subtitle">Wire resistance — did the connector damage the wire? (pre vs post)</div>
+      <canvas id="p2ChartWire" height="110"></canvas>
+    </div>
+  </div>`;
 
   function drawP2(wire) {
     const trials = c.phase2[wire];
-    const stages = ['wire_resistance_pre','preload','load_applied','postload','wire_resistance_post','reconnection'];
-    const stageLabels = ['Pre-load','Preload','Load Applied','Postload','Post-load','Reconnection'];
     const colors = themeColors();
-    const datasets = trials.map((t, i) => ({
+    const trialColors = [colors.primary, colors.success, colors.warning];
+
+    const connStages = ['preload','load_applied','postload','reconnection'];
+    const connLabels = ['Preload','Load Applied','Postload','Reconnection'];
+    const connDatasets = trials.map((t, i) => ({
       label: `Trial ${t.trial}`,
-      data: stages.map(s => t[s+'_ohm']),
-      borderColor: [colors.primary, colors.success, colors.warning][i % 3],
-      backgroundColor: [colors.primary, colors.success, colors.warning][i % 3],
+      data: connStages.map(s => t[s+'_ohm']),
+      borderColor: trialColors[i % 3],
+      backgroundColor: trialColors[i % 3],
       tension: 0.3, spanGaps: true,
     }));
-    const ctx = $('#p2Chart').getContext('2d');
-    const chart = new Chart(ctx, {
+    const ctx1 = $('#p2ChartConn').getContext('2d');
+    charts.push(new Chart(ctx1, {
       type: 'line',
-      data: { labels: stageLabels, datasets },
+      data: { labels: connLabels, datasets: connDatasets },
       options: {
         responsive: true,
-        plugins: { legend: { labels: { color: colors.text } }, title: { display: true, text: 'Resistance across mechanical load stages (Ω)', color: colors.text } },
+        plugins: { legend: { labels: { color: colors.text } } },
         scales: {
           x: { ticks: { color: colors.muted }, grid: { color: colors.grid } },
           y: { ticks: { color: colors.muted }, grid: { color: colors.grid }, title: { display: true, text: 'Ohms', color: colors.muted } }
         }
       }
-    });
-    charts.push(chart);
+    }));
+
+    const wireStages = ['wire_resistance_pre','wire_resistance_post'];
+    const wireLabels = ['Pre-load (wire)','Post-load (wire)'];
+    const wireDatasets = trials.map((t, i) => ({
+      label: `Trial ${t.trial}`,
+      data: wireStages.map(s => t[s+'_ohm']),
+      borderColor: trialColors[i % 3],
+      backgroundColor: trialColors[i % 3],
+      tension: 0.3, spanGaps: true,
+    }));
+    const ctx2 = $('#p2ChartWire').getContext('2d');
+    charts.push(new Chart(ctx2, {
+      type: 'line',
+      data: { labels: wireLabels, datasets: wireDatasets },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: colors.text } } },
+        scales: {
+          x: { ticks: { color: colors.muted }, grid: { color: colors.grid } },
+          y: { ticks: { color: colors.muted }, grid: { color: colors.grid }, title: { display: true, text: 'Ohms', color: colors.muted } }
+        }
+      }
+    }));
   }
   drawP2(wires[0]);
   $$('#p2WireChips .chip').forEach(chip => chip.addEventListener('click', () => {
@@ -335,7 +377,7 @@ function renderP3Section(c) {
   $$('#p3WireChips .chip').forEach(chip => chip.addEventListener('click', () => {
     $$('#p3WireChips .chip').forEach(c2 => c2.classList.remove('active'));
     chip.classList.add('active');
-    charts = charts.filter(ch => { ch.destroy(); return false; });
+    destroyCharts();
     drawP3(chip.dataset.wire);
   }));
 }
@@ -440,7 +482,7 @@ function renderWireRankTable() {
           <td>${r.compatible ? i+1 : '—'}</td>
           <td>${r.name}</td>
           <td>${r.compatible ? fmtOhm(r.meanOhm) : 'Not compatible'}</td>
-          <td>${r.compatible ? r.nTrials : '—'}</td>
+          <td>${r.compatible ? `<span class="${r.nTrials < 3 ? 'low-trial-count' : ''}">${r.nTrials}</span>` : '—'}</td>
           <td>${r.compatible ? fmtCV(r.cv) : '—'}</td>
           <td>${r.notSpecified ? '<span class="badge badge-partial">Connector not specified for this wire type</span>' : ''}</td>
         </tr>
@@ -450,7 +492,6 @@ function renderWireRankTable() {
 }
 
 function inRange(rangeStr, awg) {
-  // e.g. "18-22" or "10-12" or "14-18"
   const parts = rangeStr.split('-').map(s => parseInt(s.trim()));
   if (parts.length !== 2) return true;
   const [lo, hi] = [Math.min(...parts), Math.max(...parts)];
@@ -465,7 +506,14 @@ function renderCompare() {
   const connIds = Object.keys(DATA.connectors).sort((a,b) => DATA.connectors[a].name.localeCompare(DATA.connectors[b].name));
   if (!cmpA) cmpA = connIds[0];
   if (!cmpB) cmpB = connIds[1] || connIds[0];
-  if (!cmpWire) cmpWire = DATA.wire_order[0];
+
+  const A = DATA.connectors[cmpA], B = DATA.connectors[cmpB];
+  const availableWires = DATA.wire_order.filter(w => {
+    const hasA = A.phase3 && A.phase3[w];
+    const hasB = B.phase3 && B.phase3[w];
+    return hasA || hasB;
+  });
+  if (!cmpWire || !availableWires.includes(cmpWire)) cmpWire = availableWires[0] || DATA.wire_order[0];
 
   main.innerHTML = `
     <div class="topbar">
@@ -489,8 +537,8 @@ function renderCompare() {
       <div id="baselineTable"></div>
     </div>
     <div class="section">
-      <div class="section-title">Detailed Comparison</div>
-      <div class="chip-row" id="cmpWireChips">${DATA.wire_order.map(w => `<button class="chip ${w===cmpWire?'active':''}" data-wire="${w}">${DATA.wire_labels[w]}</button>`).join('')}</div>
+      <div class="section-title">Detailed Comparison (resistance vs current)</div>
+      <div class="chip-row" id="cmpWireChips">${availableWires.map(w => `<button class="chip ${w===cmpWire?'active':''}" data-wire="${w}">${DATA.wire_labels[w]}</button>`).join('')}</div>
       <div class="chart-container"><canvas id="cmpChart" height="100"></canvas></div>
     </div>
   `;
@@ -513,14 +561,26 @@ function renderBaselineTable() {
     const valA = wdA && wdA.status !== 'not_compatible' ? wdA.mean_ohm : null;
     const valB = wdB && wdB.status !== 'not_compatible' ? wdB.mean_ohm : null;
     let clsA = 'cmp-cell-neutral', clsB = 'cmp-cell-neutral';
-    if (valA !== null && valB === null) clsA = 'cmp-cell-green';
-    else if (valB !== null && valA === null) clsB = 'cmp-cell-green';
+
+    if (valA !== null && valB === null) { clsA = 'cmp-cell-green'; }
+    else if (valB !== null && valA === null) { clsB = 'cmp-cell-green'; }
     else if (valA !== null && valB !== null) {
-      const cvA = wdA.cv_pct || 0, cvB = wdB.cv_pct || 0;
-      const tolerance = Math.max(cvA, cvB, 5) / 100 * Math.max(valA, valB);
-      if (Math.abs(valA - valB) <= tolerance) { clsA = 'cmp-cell-green'; clsB = 'cmp-cell-green'; }
-      else if (valA < valB) { clsA = 'cmp-cell-green'; clsB = 'cmp-cell-red'; }
-      else { clsB = 'cmp-cell-green'; clsA = 'cmp-cell-red'; }
+      // Determine the better (lower resistance) connector -> always green.
+      // The worse connector is ALSO green (tie) only if it falls within the
+      // BETTER connector's CV% band around the better connector's own mean.
+      // Otherwise the worse connector is red.
+      let betterVal, betterCV, worseVal, betterIsA;
+      if (valA <= valB) { betterVal = valA; betterCV = wdA.cv_pct || 0; worseVal = valB; betterIsA = true; }
+      else { betterVal = valB; betterCV = wdB.cv_pct || 0; worseVal = valA; betterIsA = false; }
+      const tolerance = (betterCV / 100) * betterVal;
+      const isTie = Math.abs(worseVal - betterVal) <= Math.max(tolerance, 0);
+      if (betterIsA) {
+        clsA = 'cmp-cell-green';
+        clsB = isTie ? 'cmp-cell-green' : 'cmp-cell-red';
+      } else {
+        clsB = 'cmp-cell-green';
+        clsA = isTie ? 'cmp-cell-green' : 'cmp-cell-red';
+      }
     }
     return { w, valA, valB, clsA, clsB };
   });
@@ -587,24 +647,23 @@ function renderAbout() {
       <p>Static resistance measurements taken with a 4-wire Kelvin connection via a Keithley DMM in autoranging mode (no fixed test current — whatever the meter supplied). Each connector was tested against up to 15 wire types across 3 trials. This is the baseline resistance shown on connector cards and used throughout the app as the primary "how good is this connector" number.</p>
 
       <h3>Phase 2 — Mechanical Load Response</h3>
-      <p>Voltage drop measured across six mechanical stages (pre-load, preload, load applied, postload, post-load, reconnection) at a constant 100 mA test current, converted to resistance. This reveals how connectors behave under physical stress and reconnection.</p>
+      <p>Voltage drop measured across six mechanical stages at a constant 100 mA test current, converted to resistance. Two charts separate connector performance from wire condition: the connector-resistance chart (preload → load applied → postload → reconnection) shows how the connector itself behaves under physical stress and reconnection; the wire-resistance chart (pre-load vs post-load) isolates whether the connector damaged the wire itself during testing.</p>
 
       <h3>Phase 3 — Current Sensitivity</h3>
       <p>Voltage drop swept across four current levels (1, 10, 100, 1000 mA), each with an immediate reading and a delayed "dwell" reading (30s for the first three steps, 60s for 1000 mA). This shows how resistance changes with current draw and over time under load.</p>
 
-      <h3>Compatibility Status</h3>
-      <ul>
-        <li><strong>Compatible</strong> — valid trial data exists for every wire type of a given AWG.</li>
-        <li><strong>Partial</strong> — data exists for some but not all wire types of that AWG; the average shown only reflects the tested subset.</li>
-        <li><strong>Not compatible</strong> — no valid trial data exists for any wire type of that AWG (mechanically incompatible, not tested, or all attempts invalid).</li>
-      </ul>
+      <h3>Compatibility Status &amp; Coverage Gradient</h3>
+      <p>Each AWG line on a connector card shows a fraction (e.g. "3/5") of how many of the five wire types in that AWG have valid trial data, colored on a gradient from red (0 or 1 of 5 tested) through yellow (3 of 5) to green (5 of 5, fully compatible). A 0/5 line is marked "Not compatible" in a brighter red.</p>
       <p>Manufacturer-rated AWG ranges (from connector reference data) are informational only — if test data shows a connector actually works with a wire outside its rated range, the measured result is shown as-is, flagged with "Connector not specified for this wire type" rather than being hidden.</p>
 
       <h3>Variability (CV%)</h3>
-      <p>Coefficient of variation — standard deviation divided by mean, as a percentage — describes how consistent repeated trials were for a given connector/wire combination. Lower is more consistent. When only one valid trial exists, this shows as "N/A (n=1)" since variability can't be computed from a single point.</p>
+      <p>Coefficient of variation — standard deviation divided by mean, as a percentage — describes how consistent repeated trials were for a given connector/wire combination. Lower is more consistent. When only one valid trial exists, this shows as "N/A (n=1)" since variability can't be computed from a single point. In the By Wire Type view, any row backed by fewer than 3 trials shows its trial count in maroon as a caution flag.</p>
+
+      <h3>Compare Logic</h3>
+      <p>In the baseline comparison table, the connector with lower mean resistance for a given wire type is always shown in green. The higher-resistance connector is also shown green (a "tie") only if its value falls within the better connector's own coefficient-of-variation band around the better connector's mean — otherwise it's shown in red. This avoids a noisy, high-variability connector falsely appearing tied with a much better performer.</p>
 
       <h3>Data Corrections Applied</h3>
-      <p>Four Phase 3 readings flagged as likely decimal-point transcription errors (roughly 5–15x off from the paired immediate/dwell reading) were corrected after manual review: WASPP6 / 30 AWG Magnet Wire, Fluke Networks MT-8203-20 Intellitone / 14 AWG Silicone Stranded, 3M Scotchlok 951 / 14 AWG PVC Stranded, and Posi-Tap Yellow / 14 AWG PVC Stranded.</p>
+      <p>Four Phase 3 readings flagged as likely decimal-point transcription errors (roughly 5–15x off from the paired immediate/dwell reading) were corrected after manual review: WASPP / 30 AWG Magnet Wire, Fluke Networks MT-8203-20 Intellitone / 14 AWG Silicone Stranded, 3M Scotchlok 951 / 14 AWG PVC Stranded, and Posi-Tap Yellow / 14 AWG PVC Stranded.</p>
     </div>
   `;
 }
