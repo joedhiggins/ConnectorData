@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Connector Test Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div class="app-shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="logo-row">
+      <svg width="28" height="28" viewBox="0 0 32 32" fill="none" aria-label="Connector Test Explorer logo">
+        <circle cx="16" cy="16" r="14" stroke="currentColor" stroke-width="2" style="color:var(--color-primary)"/>
+        <path d="M10 16h4m4 0h4M14 12v8m4-8v8" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="color:var(--color-primary)"/>
+      </svg>
+      <span>CONNECTOR TEST</span>
+    </div>
+    <nav class="nav-list" id="navList" role="list">
+      <button class="nav-item active" data-view="by-connector">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        By Connector
+      </button>
+      <button class="nav-item" data-view="by-wire">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12h16M4 6h10M4 18h7"/></svg>
+        By Wire Type
+      </button>
+      <button class="nav-item" data-view="compare">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v18M16 3v18M3 8h5M16 8h5M3 16h5M16 16h5"/></svg>
+        Compare
+      </button>
+      <button class="nav-item" data-view="about">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+        About This Data
+      </button>
+    </nav>
+    <div style="margin-top:auto; display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-size:var(--text-xs); color:var(--color-text-muted);">v2 build</span>
+      <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode"></button>
+    </div>
+  </aside>
+
+  <button class="mobile-menu-btn" id="mobileMenuBtn" aria-label="Open menu" style="position:fixed; top:16px; left:16px; z-index:50; background:var(--color-surface);">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+  </button>
+  <div class="mobile-nav" id="mobileNav">
+    <button class="back-btn" id="mobileNavClose" style="align-self:flex-end;">Close ✕</button>
+    <button class="nav-item" data-view="by-connector">By Connector</button>
+    <button class="nav-item" data-view="by-wire">By Wire Type</button>
+    <button class="nav-item" data-view="compare">Compare</button>
+    <button class="nav-item" data-view="about">About This Data</button>
+  </div>
+
+  <main class="main-content" id="mainContent">
+    <div class="empty-state"><h3>Loading data…</h3></div>
+  </main>
+</div>
+
+<script src="./app.js"></script>
+</body>
+</html>
