@@ -8,6 +8,9 @@ let showNotCompatible = true;
 let cmpA = null, cmpB = null, cmpWire = null;
 let searchQuery = '';
 let charts = [];
+let p3TrialToggle = {}; // per chart-instance key -> {mean:true, 1:false, 2:false, 3:false}
+let showUncertaintyBand = true;
+let heatmapSort = null; // {wire, dir}
 
 const $ = (sel, el=document) => el.querySelector(sel);
 const $$ = (sel, el=document) => Array.from(el.querySelectorAll(sel));
@@ -21,21 +24,42 @@ function fmtCV(v) {
   return `CV ${v}%`;
 }
 function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }
-
 function isDark() { return document.documentElement.getAttribute('data-theme') === 'dark'; }
 
-// gradient: fraction 0.2 (1/5) -> red, 0.6 (3/5) -> yellow, 1.0 (5/5) -> green
-// 0/5 handled separately as bright/deep red
 function gradientColor(tested, possible) {
-  if (tested === 0) {
-    return isDark() ? '#ff5c6a' : '#c0182b'; // bright red, distinct from gradient red
-  }
+  if (tested === 0) return isDark() ? '#ff5c6a' : '#c0182b';
   const f = tested / possible;
   const fClamped = Math.max(0.2, Math.min(1, f));
-  const hue = ((fClamped - 0.2) / 0.8) * 120; // 0=red .. 120=green
+  const hue = ((fClamped - 0.2) / 0.8) * 120;
   const light = isDark() ? 62 : 36;
   const sat = isDark() ? 75 : 68;
   return `hsl(${hue.toFixed(0)}, ${sat}%, ${light}%)`;
+}
+
+// ===== DMM uncertainty interpolation =====
+// Given |V| in mV and current level (string key '1'|'10'|'100'|'1000'), return ± error in mV,
+// log-linearly interpolated between breakpoints (extrapolated flat outside range).
+function dmmErrorMv(absVmV, currentKey) {
+  const table = DATA.dmm_uncertainty_mV[currentKey];
+  if (!table || absVmV <= 0) return table ? table[0][1] : 0.0035;
+  if (absVmV <= table[0][0]) return table[0][1];
+  if (absVmV >= table[table.length-1][0]) return table[table.length-1][1];
+  for (let i = 0; i < table.length-1; i++) {
+    const [v0,e0] = table[i], [v1,e1] = table[i+1];
+    if (absVmV >= v0 && absVmV <= v1) {
+      const t = (Math.log(absVmV)-Math.log(v0))/(Math.log(v1)-Math.log(v0));
+      return e0 + t*(e1-e0);
+    }
+  }
+  return table[table.length-1][1];
+}
+// Convert a resistance reading + current(mA) into ± resistance uncertainty band (ohms)
+function resistanceUncertainty(rOhm, currentMA) {
+  if (rOhm === null || rOhm === undefined) return null;
+  const I_A = currentMA/1000;
+  const vMv = Math.abs(rOhm * I_A) * 1000; // V = IR, in mV
+  const errMv = dmmErrorMv(vMv, String(currentMA));
+  return (errMv/1000) / I_A; // ohms
 }
 
 // ===== Theme =====
@@ -76,7 +100,6 @@ function setView(view) {
   render();
 }
 
-// ===== Chart color helpers =====
 function themeColors() {
   const cs = getComputedStyle(document.documentElement);
   return {
@@ -88,7 +111,16 @@ function themeColors() {
     error: cs.getPropertyValue('--color-error').trim(),
     warning: cs.getPropertyValue('--color-warning').trim(),
     surface: cs.getPropertyValue('--color-surface').trim(),
+    maroon: cs.getPropertyValue('--color-maroon').trim(),
   };
+}
+function hexToRgba(hex, alpha) {
+  // handles hsl() or hex; fallback simple
+  if (hex.startsWith('#')) {
+    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
+  return hex;
 }
 
 // ===== Data loading =====
@@ -109,6 +141,8 @@ function render() {
     renderByWireType();
   } else if (currentView === 'compare') {
     renderCompare();
+  } else if (currentView === 'heatmap') {
+    renderHeatmap();
   } else if (currentView === 'about') {
     renderAbout();
   }
@@ -328,6 +362,40 @@ function renderP2Section(c) {
   }));
 }
 
+// ---- Phase 3: shared helpers for uncertainty band + overlap flag ----
+function computeP3PointStats(byCurrent, currents) {
+  // returns array aligned with currents: {mean, lower, upper, trials:[{trial,imm,dwell}]}
+  return currents.map(cur => {
+    const trials = byCurrent[cur] || [];
+    const immVals = trials.map(t => t.immediate_ohm).filter(v => v !== null && v !== undefined);
+    const mean = immVals.length ? immVals.reduce((a,b)=>a+b,0)/immVals.length : null;
+    const unc = mean !== null ? resistanceUncertainty(mean, cur) : null;
+    return {
+      current: cur, mean,
+      lower: mean !== null ? Math.max(0, mean - unc) : null,
+      upper: mean !== null ? mean + unc : null,
+      unc,
+      trials
+    };
+  });
+}
+function flagOverlaps(points) {
+  // returns array of booleans same length: true if this point's band overlaps an ADJACENT point's band
+  const flags = points.map(() => false);
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (p.mean === null) continue;
+    const neighbors = [i-1, i+1].filter(j => j >= 0 && j < points.length);
+    for (const j of neighbors) {
+      const q = points[j];
+      if (q.mean === null) continue;
+      const overlap = p.lower <= q.upper && q.lower <= p.upper;
+      if (overlap) { flags[i] = true; flags[j] = true; }
+    }
+  }
+  return flags;
+}
+
 function renderP3Section(c) {
   const el = $('#p3Section');
   if (!c.phase3) {
@@ -336,35 +404,81 @@ function renderP3Section(c) {
   }
   const wires = Object.keys(c.phase3);
   el.innerHTML = `<div class="chip-row" id="p3WireChips">${wires.map((w,i) => `<button class="chip ${i===0?'active':''}" data-wire="${w}">${DATA.wire_labels[w] || w}</button>`).join('')}</div>
-  <div class="chart-container"><canvas id="p3Chart" height="90"></canvas></div>`;
+  <div class="chip-row" id="p3TrialChips"></div>
+  <div class="chart-container">
+    <canvas id="p3Chart" height="90"></canvas>
+    <div class="chart-footnote">
+      <label class="uncertainty-toggle"><input type="checkbox" id="p3UncToggle" ${showUncertaintyBand?'checked':''}> Show DMM measurement-uncertainty band</label>
+      <span><span class="overlap-flag">*</span> = error bands overlap adjacent current step (values not statistically distinguishable)</span>
+    </div>
+  </div>`;
 
-  function drawP3(wire) {
-    const byCurrent = c.phase3[wire];
+  let activeWire = wires[0];
+  let trialState = { mean: true, 1: false, 2: false, 3: false };
+
+  function drawP3() {
+    const byCurrent = c.phase3[activeWire];
     const currents = [1,10,100,1000].filter(cur => byCurrent[cur]);
     const colors = themeColors();
-    const immData = currents.map(cur => {
-      const trials = byCurrent[cur];
-      const vals = trials.map(t => t.immediate_ohm).filter(v => v !== null);
-      return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
+    const points = computeP3PointStats(byCurrent, currents);
+    const overlapFlags = flagOverlaps(points);
+
+    const datasets = [];
+    if (showUncertaintyBand) {
+      datasets.push({
+        label: 'Upper bound', data: points.map(p => p.upper), borderWidth: 0, pointRadius: 0,
+        fill: '+1', backgroundColor: hexToRgba(colors.primary, 0.15), order: 5, spanGaps: true,
+      });
+      datasets.push({
+        label: 'Lower bound', data: points.map(p => p.lower), borderWidth: 0, pointRadius: 0,
+        fill: false, order: 5, spanGaps: true,
+      });
+    }
+    if (trialState.mean) {
+      datasets.push({
+        label: 'Mean (immediate)', data: points.map(p => p.mean), borderColor: colors.primary,
+        backgroundColor: colors.primary, tension: 0.3, order: 1, spanGaps: true,
+        pointStyle: points.map((p,i) => overlapFlags[i] ? 'star' : 'circle'),
+        pointRadius: points.map((p,i) => overlapFlags[i] ? 7 : 4),
+      });
+      const dwellVals = currents.map(cur => {
+        const trials = byCurrent[cur];
+        const vals = trials.map(t => t.dwell_ohm).filter(v => v !== null);
+        return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
+      });
+      datasets.push({ label: 'Mean (dwell)', data: dwellVals, borderColor: colors.warning, backgroundColor: colors.warning, tension: 0.3, order: 2, spanGaps: true, borderDash: [4,3] });
+    }
+    const trialColors = { 1: colors.success, 2: colors.error, 3: colors.maroon };
+    [1,2,3].forEach(tn => {
+      if (!trialState[tn]) return;
+      const immData = currents.map(cur => {
+        const t = (byCurrent[cur]||[]).find(x => x.trial === tn);
+        return t ? t.immediate_ohm : null;
+      });
+      datasets.push({ label: `Trial ${tn} (immediate)`, data: immData, borderColor: trialColors[tn], backgroundColor: trialColors[tn], tension: 0.3, order: 3, spanGaps: true, borderDash: [2,2] });
     });
-    const dwellData = currents.map(cur => {
-      const trials = byCurrent[cur];
-      const vals = trials.map(t => t.dwell_ohm).filter(v => v !== null);
-      return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
-    });
+
     const ctx = $('#p3Chart').getContext('2d');
     const chart = new Chart(ctx, {
       type: 'line',
-      data: {
-        labels: currents.map(c2 => c2 + ' mA'),
-        datasets: [
-          { label: 'Immediate', data: immData, borderColor: colors.primary, backgroundColor: colors.primary, tension: 0.3 },
-          { label: 'Dwell', data: dwellData, borderColor: colors.warning, backgroundColor: colors.warning, tension: 0.3 },
-        ]
-      },
+      data: { labels: currents.map(c2 => c2 + ' mA'), datasets },
       options: {
         responsive: true,
-        plugins: { legend: { labels: { color: colors.text } }, title: { display: true, text: 'Resistance vs current (log scale), mean of trials', color: colors.text } },
+        plugins: {
+          legend: { labels: { color: colors.text, filter: item => item.text !== 'Upper bound' && item.text !== 'Lower bound' } },
+          title: { display: true, text: 'Resistance vs current (log scale), mean of trials', color: colors.text },
+          tooltip: {
+            callbacks: {
+              afterLabel: (ctx2) => {
+                const idx = ctx2.dataIndex;
+                if (overlapFlags[idx] && (ctx2.dataset.label||'').includes('Mean')) {
+                  return `± ${points[idx].unc?.toFixed(4)} Ω uncertainty — overlaps adjacent point`;
+                }
+                return '';
+              }
+            }
+          }
+        },
         scales: {
           x: { ticks: { color: colors.muted }, grid: { color: colors.grid } },
           y: { type: 'logarithmic', ticks: { color: colors.muted }, grid: { color: colors.grid }, title: { display: true, text: 'Ohms', color: colors.muted } }
@@ -373,13 +487,38 @@ function renderP3Section(c) {
     });
     charts.push(chart);
   }
-  drawP3(wires[0]);
+
+  function renderTrialChips() {
+    const maxTrials = Math.max(...Object.values(c.phase3[activeWire]).map(arr => arr.length), 0);
+    const chipsEl = $('#p3TrialChips');
+    let html = `<button class="chip trial-chip ${trialState.mean?'active':''}" data-t="mean">Mean</button>`;
+    for (let i=1;i<=Math.min(maxTrials,3);i++) html += `<button class="chip trial-chip ${trialState[i]?'active':''}" data-t="${i}">Trial ${i}</button>`;
+    chipsEl.innerHTML = html;
+    $$('#p3TrialChips .chip').forEach(chip => chip.addEventListener('click', () => {
+      const t = chip.dataset.t === 'mean' ? 'mean' : parseInt(chip.dataset.t);
+      trialState[t] = !trialState[t];
+      chip.classList.toggle('active', trialState[t]);
+      destroyCharts();
+      drawP3();
+    }));
+  }
+
+  renderTrialChips();
+  drawP3();
   $$('#p3WireChips .chip').forEach(chip => chip.addEventListener('click', () => {
     $$('#p3WireChips .chip').forEach(c2 => c2.classList.remove('active'));
     chip.classList.add('active');
+    activeWire = chip.dataset.wire;
+    trialState = { mean: true, 1: false, 2: false, 3: false };
+    renderTrialChips();
     destroyCharts();
-    drawP3(chip.dataset.wire);
+    drawP3();
   }));
+  $('#p3UncToggle').addEventListener('change', e => {
+    showUncertaintyBand = e.target.checked;
+    destroyCharts();
+    drawP3();
+  });
 }
 
 function renderNotesSection(c) {
@@ -539,13 +678,20 @@ function renderCompare() {
     <div class="section">
       <div class="section-title">Detailed Comparison (resistance vs current)</div>
       <div class="chip-row" id="cmpWireChips">${availableWires.map(w => `<button class="chip ${w===cmpWire?'active':''}" data-wire="${w}">${DATA.wire_labels[w]}</button>`).join('')}</div>
-      <div class="chart-container"><canvas id="cmpChart" height="100"></canvas></div>
+      <div class="chart-container">
+        <canvas id="cmpChart" height="100"></canvas>
+        <div class="chart-footnote">
+          <label class="uncertainty-toggle"><input type="checkbox" id="cmpUncToggle" ${showUncertaintyBand?'checked':''}> Show DMM measurement-uncertainty band</label>
+          <span><span class="overlap-flag">*</span> = error bands overlap adjacent current step</span>
+        </div>
+      </div>
     </div>
   `;
 
   $('#cmpASel').addEventListener('change', e => { cmpA = e.target.value; renderCompare(); });
   $('#cmpBSel').addEventListener('change', e => { cmpB = e.target.value; renderCompare(); });
   $$('#cmpWireChips .chip').forEach(chip => chip.addEventListener('click', () => { cmpWire = chip.dataset.wire; renderCompare(); }));
+  $('#cmpUncToggle').addEventListener('change', e => { showUncertaintyBand = e.target.checked; destroyCharts(); drawCmpChart(); });
 
   renderBaselineTable();
   drawCmpChart();
@@ -565,22 +711,13 @@ function renderBaselineTable() {
     if (valA !== null && valB === null) { clsA = 'cmp-cell-green'; }
     else if (valB !== null && valA === null) { clsB = 'cmp-cell-green'; }
     else if (valA !== null && valB !== null) {
-      // Determine the better (lower resistance) connector -> always green.
-      // The worse connector is ALSO green (tie) only if it falls within the
-      // BETTER connector's CV% band around the better connector's own mean.
-      // Otherwise the worse connector is red.
       let betterVal, betterCV, worseVal, betterIsA;
       if (valA <= valB) { betterVal = valA; betterCV = wdA.cv_pct || 0; worseVal = valB; betterIsA = true; }
       else { betterVal = valB; betterCV = wdB.cv_pct || 0; worseVal = valA; betterIsA = false; }
       const tolerance = (betterCV / 100) * betterVal;
       const isTie = Math.abs(worseVal - betterVal) <= Math.max(tolerance, 0);
-      if (betterIsA) {
-        clsA = 'cmp-cell-green';
-        clsB = isTie ? 'cmp-cell-green' : 'cmp-cell-red';
-      } else {
-        clsB = 'cmp-cell-green';
-        clsA = isTie ? 'cmp-cell-green' : 'cmp-cell-red';
-      }
+      if (betterIsA) { clsA = 'cmp-cell-green'; clsB = isTie ? 'cmp-cell-green' : 'cmp-cell-red'; }
+      else { clsB = 'cmp-cell-green'; clsA = isTie ? 'cmp-cell-green' : 'cmp-cell-red'; }
     }
     return { w, valA, valB, clsA, clsB };
   });
@@ -602,28 +739,45 @@ function drawCmpChart() {
   const A = DATA.connectors[cmpA], B = DATA.connectors[cmpB];
   const colors = themeColors();
   const currents = [1,10,100,1000];
-  function seriesFor(conn) {
-    return currents.map(cur => {
-      const trials = conn.phase3?.[cmpWire]?.[cur];
-      if (!trials || !trials.length) return null;
-      const vals = [];
-      trials.forEach(t => { if (t.immediate_ohm !== null) vals.push(t.immediate_ohm); });
-      return vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
-    });
+
+  function seriesStats(conn) {
+    const byCurrent = conn.phase3?.[cmpWire];
+    if (!byCurrent) return currents.map(() => ({mean:null,lower:null,upper:null}));
+    return computeP3PointStats(byCurrent, currents);
   }
+  const statsA = seriesStats(A), statsB = seriesStats(B);
+  const flagsA = flagOverlaps(statsA), flagsB = flagOverlaps(statsB);
+
+  const datasets = [];
+  if (showUncertaintyBand) {
+    datasets.push({ label:'A upper', data: statsA.map(p=>p.upper), borderWidth:0, pointRadius:0, fill:'+1', backgroundColor: hexToRgba(colors.primary,0.12), order:6, spanGaps:true });
+    datasets.push({ label:'A lower', data: statsA.map(p=>p.lower), borderWidth:0, pointRadius:0, fill:false, order:6, spanGaps:true });
+    datasets.push({ label:'B upper', data: statsB.map(p=>p.upper), borderWidth:0, pointRadius:0, fill:'+1', backgroundColor: hexToRgba(colors.warning,0.12), order:6, spanGaps:true });
+    datasets.push({ label:'B lower', data: statsB.map(p=>p.lower), borderWidth:0, pointRadius:0, fill:false, order:6, spanGaps:true });
+  }
+  datasets.push({
+    label: A.name, data: statsA.map(p=>p.mean), borderColor: colors.primary, backgroundColor: colors.primary,
+    tension: 0.3, spanGaps: true, order:1,
+    pointStyle: statsA.map((p,i)=> flagsA[i] ? 'star' : 'circle'),
+    pointRadius: statsA.map((p,i)=> flagsA[i] ? 7 : 4),
+  });
+  datasets.push({
+    label: B.name, data: statsB.map(p=>p.mean), borderColor: colors.warning, backgroundColor: colors.warning,
+    tension: 0.3, spanGaps: true, order:2,
+    pointStyle: statsB.map((p,i)=> flagsB[i] ? 'star' : 'circle'),
+    pointRadius: statsB.map((p,i)=> flagsB[i] ? 7 : 4),
+  });
+
   const ctx = $('#cmpChart').getContext('2d');
   const chart = new Chart(ctx, {
     type: 'line',
-    data: {
-      labels: currents.map(c => c + ' mA'),
-      datasets: [
-        { label: A.name, data: seriesFor(A), borderColor: colors.primary, backgroundColor: colors.primary, tension: 0.3, spanGaps: true },
-        { label: B.name, data: seriesFor(B), borderColor: colors.warning, backgroundColor: colors.warning, tension: 0.3, spanGaps: true },
-      ]
-    },
+    data: { labels: currents.map(c => c + ' mA'), datasets },
     options: {
       responsive: true,
-      plugins: { legend: { labels: { color: colors.text } }, title: { display: true, text: `${DATA.wire_labels[cmpWire]} — immediate resistance vs current (log scale)`, color: colors.text } },
+      plugins: {
+        legend: { labels: { color: colors.text, filter: item => !item.text.endsWith('upper') && !item.text.endsWith('lower') } },
+        title: { display: true, text: `${DATA.wire_labels[cmpWire]} — immediate resistance vs current (log scale)`, color: colors.text }
+      },
       scales: {
         x: { ticks: { color: colors.muted }, grid: { color: colors.grid } },
         y: { type: 'logarithmic', ticks: { color: colors.muted }, grid: { color: colors.grid }, title: { display: true, text: 'Ohms', color: colors.muted } }
@@ -631,6 +785,84 @@ function drawCmpChart() {
     }
   });
   charts.push(chart);
+}
+
+// ============================================================
+// VIEW: Phase 1 Matrix (Heatmap)
+// ============================================================
+function renderHeatmap() {
+  const main = $('#mainContent');
+  main.innerHTML = `
+    <div class="topbar">
+      <div>
+        <div class="page-title">Phase 1 Matrix</div>
+        <div class="page-sub">All connectors × all wire types — mean resistance and CV%. Click a wire-type header to sort.</div>
+      </div>
+      <input type="text" class="search-input" placeholder="Filter connectors…" id="hmSearch">
+    </div>
+    <div class="heatmap-scroll"><div id="hmTableWrap"></div></div>
+  `;
+  $('#hmSearch').addEventListener('input', e => { renderHeatmapTable(e.target.value); });
+  renderHeatmapTable('');
+}
+
+function renderHeatmapTable(filterText) {
+  const wrap = $('#hmTableWrap');
+  let connIds = Object.keys(DATA.connectors);
+  if (filterText) connIds = connIds.filter(id => DATA.connectors[id].name.toLowerCase().includes(filterText.toLowerCase()));
+
+  function getCell(cid, wire) {
+    const awg = parseInt(wire.slice(0,2));
+    const wd = DATA.connectors[cid].phase1.by_awg[awg]?.by_wire?.[wire];
+    return wd && wd.status !== 'not_compatible' ? wd : null;
+  }
+
+  if (heatmapSort) {
+    const { wire, dir } = heatmapSort;
+    connIds.sort((a,b) => {
+      const ca = getCell(a, wire), cb = getCell(b, wire);
+      const va = ca ? ca.mean_ohm : null, vb = cb ? cb.mean_ohm : null;
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      return dir === 'asc' ? va - vb : vb - va;
+    });
+  } else {
+    connIds.sort((a,b) => DATA.connectors[a].name.localeCompare(DATA.connectors[b].name));
+  }
+
+  const headerCells = DATA.wire_order.map(w => {
+    const sortIndicator = heatmapSort && heatmapSort.wire === w ? (heatmapSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="wire-col-header" data-wire="${w}">${DATA.wire_labels[w]}${sortIndicator}</th>`;
+  }).join('');
+
+  const bodyRows = connIds.map(cid => {
+    const cells = DATA.wire_order.map(w => {
+      const wd = getCell(cid, w);
+      if (!wd) return `<td class="hm-cell hm-na">—</td>`;
+      const awg = parseInt(w.slice(0,2));
+      const color = gradientColor(1,1); // compatible cell always green-ish base; use CV for shading intensity instead
+      return `<td class="hm-cell"><span class="hm-mean" style="color:${gradientColor(DATA.connectors[cid].phase1.by_awg[awg].n_wire_types_tested, DATA.connectors[cid].phase1.by_awg[awg].n_wire_types_possible)}">${fmtOhm(wd.mean_ohm)}</span><span class="hm-cv">${fmtCV(wd.cv_pct)}</span></td>`;
+    }).join('');
+    return `<tr><td class="connector-name-cell">${DATA.connectors[cid].name}</td>${cells}</tr>`;
+  }).join('');
+
+  wrap.innerHTML = `
+    <table class="heatmap-table">
+      <thead><tr><th class="connector-corner">Connector</th>${headerCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  `;
+
+  $$('.wire-col-header').forEach(th => th.addEventListener('click', () => {
+    const w = th.dataset.wire;
+    if (heatmapSort && heatmapSort.wire === w) {
+      heatmapSort = heatmapSort.dir === 'asc' ? { wire: w, dir: 'desc' } : null;
+    } else {
+      heatmapSort = { wire: w, dir: 'asc' };
+    }
+    renderHeatmapTable(filterText);
+  }));
 }
 
 // ============================================================
@@ -650,17 +882,23 @@ function renderAbout() {
       <p>Voltage drop measured across six mechanical stages at a constant 100 mA test current, converted to resistance. Two charts separate connector performance from wire condition: the connector-resistance chart (preload → load applied → postload → reconnection) shows how the connector itself behaves under physical stress and reconnection; the wire-resistance chart (pre-load vs post-load) isolates whether the connector damaged the wire itself during testing.</p>
 
       <h3>Phase 3 — Current Sensitivity</h3>
-      <p>Voltage drop swept across four current levels (1, 10, 100, 1000 mA), each with an immediate reading and a delayed "dwell" reading (30s for the first three steps, 60s for 1000 mA). This shows how resistance changes with current draw and over time under load.</p>
+      <p>Voltage drop swept across four current levels (1, 10, 100, 1000 mA), each with an immediate reading and a delayed "dwell" reading (30s for the first three steps, 60s for 1000 mA). Charts show the mean immediate/dwell curve by default; toggle individual trials on to see raw trial-level scatter, useful for spotting single-trial outliers hidden by averaging.</p>
+
+      <h3>Measurement Uncertainty at Low Voltage Drop</h3>
+      <p>The Keithley DMM6500 has a fixed-floor uncertainty term (roughly ±0.0035 mV) that dominates at very small voltage drops, regardless of range or test current. At 1 mA, most connectors produce sub-1 mV drops, so this floor term alone can represent 5–58% of the reading depending on how small the drop is. This means some of the apparent "current sensitivity" seen at 1 mA (and occasionally 10 mA) in Phase 3 charts is measurement noise rather than a real physical effect — at these currents, contact self-heating is nanowatts to low microwatts, far too small to meaningfully shift metal-contact resistance. Phase 3 charts show a shaded band reflecting this calculated uncertainty (toggle on/off), and mark a point with <span class="overlap-flag">*</span> when its uncertainty band overlaps an adjacent current step's band — meaning the two readings are not statistically distinguishable given instrument precision alone.</p>
 
       <h3>Compatibility Status &amp; Coverage Gradient</h3>
-      <p>Each AWG line on a connector card shows a fraction (e.g. "3/5") of how many of the five wire types in that AWG have valid trial data, colored on a gradient from red (0 or 1 of 5 tested) through yellow (3 of 5) to green (5 of 5, fully compatible). A 0/5 line is marked "Not compatible" in a brighter red.</p>
+      <p>Each AWG line on a connector card shows a fraction (e.g. "3/5") of how many of the five wire types in that AWG have valid trial data, colored on a gradient from red (0 or 1 of 5 tested) through yellow (3 of 5) to green (5 of 5, fully compatible). A 0/5 line is marked "Not compatible" in a brighter red. The same gradient colors the mean-resistance figures in the Phase 1 Matrix view.</p>
       <p>Manufacturer-rated AWG ranges (from connector reference data) are informational only — if test data shows a connector actually works with a wire outside its rated range, the measured result is shown as-is, flagged with "Connector not specified for this wire type" rather than being hidden.</p>
 
       <h3>Variability (CV%)</h3>
       <p>Coefficient of variation — standard deviation divided by mean, as a percentage — describes how consistent repeated trials were for a given connector/wire combination. Lower is more consistent. When only one valid trial exists, this shows as "N/A (n=1)" since variability can't be computed from a single point. In the By Wire Type view, any row backed by fewer than 3 trials shows its trial count in maroon as a caution flag.</p>
 
       <h3>Compare Logic</h3>
-      <p>In the baseline comparison table, the connector with lower mean resistance for a given wire type is always shown in green. The higher-resistance connector is also shown green (a "tie") only if its value falls within the better connector's own coefficient-of-variation band around the better connector's mean — otherwise it's shown in red. This avoids a noisy, high-variability connector falsely appearing tied with a much better performer.</p>
+      <p>In the baseline comparison table, the connector with lower mean resistance for a given wire type is always shown in green. The higher-resistance connector is also shown green (a "tie") only if its value falls within the better connector's own coefficient-of-variation band around the better connector's mean — otherwise it's shown in red. This avoids a noisy, high-variability connector falsely appearing tied with a much better performer. The Compare charts carry the same DMM uncertainty band and overlap flag as the By Connector Phase 3 charts.</p>
+
+      <h3>Phase 1 Matrix</h3>
+      <p>A single scrollable table showing every connector (rows) against every wire type (columns) for Phase 1 baseline data — mean resistance and CV% per cell, colored using the same coverage gradient. Click any wire-type column header to sort all connectors by that wire's mean resistance (ascending, then descending, then back to alphabetical).</p>
 
       <h3>Data Corrections Applied</h3>
       <p>Four Phase 3 readings flagged as likely decimal-point transcription errors (roughly 5–15x off from the paired immediate/dwell reading) were corrected after manual review: WASPP / 30 AWG Magnet Wire, Fluke Networks MT-8203-20 Intellitone / 14 AWG Silicone Stranded, 3M Scotchlok 951 / 14 AWG PVC Stranded, and Posi-Tap Yellow / 14 AWG PVC Stranded.</p>
