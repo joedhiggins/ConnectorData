@@ -904,11 +904,17 @@ function shortWireLabel(w) {
   const awg = (parts[0] || '').replace('AWG', '');
   const mid = parts[1] || '';
   const last = parts[2] || '';
-  const insul = mid === 'SILICONE' ? 'Sil' : mid === 'MAGNET' ? 'Mag' : mid;
-  if (last === 'MAGNET' || mid === 'MAGNET' && !last) return `${awg} Mag`;
+  if (mid === 'MAGNET' || last === 'MAGNET') return `${awg} Mag`;
+  const insul = mid === 'SILICONE' ? 'Sil' : mid;
   const cons = last === 'SOL' ? 'Sol' : last === 'STR' ? 'Str' : last;
-  if (mid === 'MAGNET') return `${awg} Mag`;
   return `${awg} ${insul} ${cons}`.trim();
+}
+
+function shortWireTick(w) {
+  const s = shortWireLabel(w);
+  const bits = s.split(' ');
+  if (bits.length >= 3) return [bits.slice(0, -1).join(' '), bits[bits.length - 1]];
+  return s;
 }
 
 function averageRanks(items) {
@@ -1129,7 +1135,7 @@ function renderRankings() {
 
     <div class="section">
       <div class="section-title">Finish by wire type</div>
-      <div class="chart-container"><canvas id="rankBumpChart" height="140"></canvas></div>
+      <div class="chart-container"><canvas id="rankBumpChart" height="170"></canvas></div>
     </div>
 
     <div class="section">
@@ -1321,7 +1327,7 @@ function drawRankBump(result) {
   existing.forEach(c => { c.destroy(); charts.splice(charts.indexOf(c), 1); });
 
   const colors = themeColors();
-  const labels = result.wires.map(shortWireLabel);
+  const labels = result.wires.map(shortWireTick);
   const shown = visibleBumpKeys(result);
   const datasets = result.entities.filter(e => shown.has(e.key)).map(e => {
     const pinned = rankPinned.has(e.key);
@@ -1381,7 +1387,7 @@ function drawRankBump(result) {
         }
       },
       scales: {
-        x: { ticks: { color: colors.muted, maxRotation: 90, minRotation: 90, autoSkip: false, font: { size: 10 } }, grid: { color: colors.grid } },
+        x: { ticks: { color: colors.muted, maxRotation: 0, minRotation: 0, autoSkip: false, font: { size: 10 } }, grid: { color: colors.grid } },
         y: {
           reverse: true,
           min: 1,
