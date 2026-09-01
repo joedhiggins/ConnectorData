@@ -900,12 +900,15 @@ function phase1CellN1(wd) {
 }
 
 function shortWireLabel(w) {
-  return (DATA.wire_labels[w] || w)
-    .replace(' AWG ', ' ')
-    .replace(' Magnet Wire (Polyamide)', ' Mag')
-    .replace(' Silicone Rubber', ' Sil')
-    .replace(' Stranded', ' Str')
-    .replace(' Solid', ' Sol');
+  const parts = String(w).split('_');
+  const awg = (parts[0] || '').replace('AWG', '');
+  const mid = parts[1] || '';
+  const last = parts[2] || '';
+  const insul = mid === 'SILICONE' ? 'Sil' : mid === 'MAGNET' ? 'Mag' : mid;
+  if (last === 'MAGNET' || mid === 'MAGNET' && !last) return `${awg} Mag`;
+  const cons = last === 'SOL' ? 'Sol' : last === 'STR' ? 'Str' : last;
+  if (mid === 'MAGNET') return `${awg} Mag`;
+  return `${awg} ${insul} ${cons}`.trim();
 }
 
 function averageRanks(items) {
@@ -1378,7 +1381,7 @@ function drawRankBump(result) {
         }
       },
       scales: {
-        x: { ticks: { color: colors.muted, maxRotation: 60, minRotation: 40, font: { size: 10 } }, grid: { color: colors.grid } },
+        x: { ticks: { color: colors.muted, maxRotation: 90, minRotation: 90, autoSkip: false, font: { size: 10 } }, grid: { color: colors.grid } },
         y: {
           reverse: true,
           min: 1,
