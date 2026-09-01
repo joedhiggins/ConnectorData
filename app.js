@@ -11,6 +11,22 @@ let charts = [];
 let p3TrialToggle = {}; // per chart-instance key -> {mean:true, 1:false, 2:false, 3:false}
 let showUncertaintyBand = true;
 let heatmapSort = null; // {wire, dir}
+let rankMode = 'field'; // 'field' | 'fits'
+let rankComposite = 'mean'; // 'mean' | 'min'
+let rankMetric = 'avg'; // 'avg' | 'top3' | 'zlog'
+let rankShowTopK = 8;
+let rankPinned = new Set();
+const RANK_EXCLUDE = new Set([7, 18, 24]);
+const RANK_FAMILIES = [
+  { key: 'family:scotchlok', name: 'Scotchlok family (951 / 952 / 953)', ids: [12, 13, 14] },
+  { key: 'family:positap', name: 'Posi-Tap family (Yellow / Blue / Red)', ids: [15, 16, 17] },
+];
+const RANK_PALETTE = [
+  '#01696f', '#c45c26', '#437a22', '#a12c7b', '#3b6fd8', '#b8860b',
+  '#7a1f2b', '#2a7f62', '#6b4c9a', '#964219', '#1d4e89', '#5c7a1f',
+  '#8b3a62', '#0e7c8b', '#9a6b2f', '#4a4a6a', '#2f6b3a', '#5a3d7a',
+  '#1f6f8b', '#8a4b12', '#3d6b4f',
+];
 
 const $ = (sel, el=document) => el.querySelector(sel);
 const $$ = (sel, el=document) => Array.from(el.querySelectorAll(sel));
@@ -143,6 +159,8 @@ function render() {
     renderCompare();
   } else if (currentView === 'heatmap') {
     renderHeatmap();
+  } else if (currentView === 'rankings') {
+    renderRankings();
   } else if (currentView === 'about') {
     renderAbout();
   }
@@ -866,6 +884,591 @@ function renderHeatmapTable(filterText) {
 }
 
 // ============================================================
+// VIEW: Rankings (Phase 1)
+// ============================================================
+function phase1Wire(c, wire) {
+  const awg = String(parseInt(wire, 10));
+  return c.phase1?.by_awg?.[awg]?.by_wire?.[wire] || null;
+}
+
+function phase1CellUsable(wd) {
+  return !!(wd && wd.status !== 'not_compatible' && wd.mean_ohm != null && (wd.n_trials || 0) >= 2);
+}
+
+function phase1CellN1(wd) {
+  return !!(wd && wd.status !== 'not_compatible' && wd.mean_ohm != null && (wd.n_trials || 0) < 2);
+}
+
+function shortWireLabel(w) {
+  const parts = String(w).split('_');
+  const awg = (parts[0] || '').replace('AWG', '');
+  const mid = parts[1] || '';
+  const last = parts[2] || '';
+  if (mid === 'MAGNET' || last === 'MAGNET') return `${awg} Mag`;
+  const insul = mid === 'SILICONE' ? 'Sil' : mid;
+  const cons = last === 'SOL' ? 'Sol' : last === 'STR' ? 'Str' : last;
+  return `${awg} ${insul} ${cons}`.trim();
+}
+
+function shortWireTick(w) {
+  const s = shortWireLabel(w);
+  const bits = s.split(' ');
+  if (bits.length >= 3) return [bits.slice(0, -1).join(' '), bits[bits.length - 1]];
+  return s;
+}
+
+function averageRanks(items) {
+  const sorted = [...items].sort((a, b) => a.value - b.value || a.key.localeCompare(b.key));
+  const ranks = {};
+  let i = 0;
+  while (i < sorted.length) {
+    let j = i;
+    while (j < sorted.length && sorted[j].value === sorted[i].value) j++;
+    const avg = ((i + 1) + j) / 2;
+    for (let k = i; k < j; k++) ranks[sorted[k].key] = avg;
+    i = j;
+  }
+  return ranks;
+}
+
+function zOfLogs(values) {
+  const n = values.length;
+  if (!n) return [];
+  const logs = values.map(v => Math.log(Math.max(v, 1e-9)));
+  const mean = logs.reduce((a, b) => a + b, 0) / n;
+  if (n === 1) return [0];
+  const sd = Math.sqrt(logs.reduce((s, x) => s + (x - mean) ** 2, 0) / (n - 1));
+  if (!sd) return logs.map(() => 0);
+  return logs.map(x => (x - mean) / sd);
+}
+
+function rankingEntities() {
+  const familyIdSet = new Set(RANK_FAMILIES.flatMap(f => f.ids));
+  const entities = [];
+  Object.keys(DATA.connectors).forEach(idStr => {
+    const id = parseInt(idStr, 10);
+    if (RANK_EXCLUDE.has(id)) return;
+    if (rankMode === 'field' && familyIdSet.has(id)) return;
+    const c = DATA.connectors[idStr];
+    entities.push({ key: 'c:' + id, name: c.name, ids: [id], kind: 'single' });
+  });
+  if (rankMode === 'field') {
+    RANK_FAMILIES.forEach(f => entities.push({ key: f.key, name: f.name, ids: f.ids, kind: 'family' }));
+  }
+  entities.forEach((e, i) => { e.color = RANK_PALETTE[i % RANK_PALETTE.length]; });
+  return entities;
+}
+
+function entityOhmOnWire(entity, wire) {
+  const members = [];
+  let n1dropped = false;
+  entity.ids.forEach(id => {
+    const c = DATA.connectors[String(id)];
+    const wd = phase1Wire(c, wire);
+    if (phase1CellN1(wd)) n1dropped = true;
+    if (phase1CellUsable(wd)) {
+      members.push({ id, name: c.name, ohm: wd.mean_ohm, cv: wd.cv_pct, n: wd.n_trials });
+    }
+  });
+  if (!members.length) return { ohm: null, compatible: false, n1dropped, members };
+  let ohm;
+  if (entity.kind === 'family' && members.length > 1) {
+    ohm = rankComposite === 'min'
+      ? Math.min(...members.map(m => m.ohm))
+      : members.reduce((s, m) => s + m.ohm, 0) / members.length;
+  } else {
+    ohm = members[0].ohm;
+  }
+  return { ohm, compatible: true, n1dropped, members };
+}
+
+function computeRankings() {
+  const wires = DATA.wire_order;
+  const entities = rankingEntities();
+  const N = entities.length;
+  entities.forEach(e => {
+    e.perWire = [];
+    e.ranks = [];
+    e.zVals = [];
+    e.nCompat = 0;
+  });
+
+  wires.forEach(wire => {
+    const scored = [];
+    const ohms = [];
+    entities.forEach(e => {
+      const cell = entityOhmOnWire(e, wire);
+      e.perWire.push({ wire, ...cell, rank: null, z: null });
+      if (cell.compatible) {
+        scored.push({ key: e.key, value: cell.ohm });
+        ohms.push(cell.ohm);
+      }
+    });
+    const C = scored.length;
+    const ranks = averageRanks(scored);
+    const zs = zOfLogs(ohms);
+    const zByKey = {};
+    scored.forEach((s, i) => { zByKey[s.key] = zs[i]; });
+    const zMax = zs.length ? Math.max(...zs) : 0;
+    const midrank = (C + N + 1) / 2;
+    const zMissing = zs.length >= 2 ? zMax : 1;
+
+    entities.forEach(e => {
+      const cell = e.perWire[e.perWire.length - 1];
+      if (cell.compatible) {
+        cell.rank = ranks[e.key];
+        cell.z = zByKey[e.key];
+        e.nCompat += 1;
+        e.ranks.push(cell.rank);
+        e.zVals.push(cell.z);
+      } else {
+        cell.rank = rankMode === 'field' ? midrank : null;
+        cell.z = rankMode === 'field' ? zMissing : null;
+        if (rankMode === 'field') {
+          e.ranks.push(cell.rank);
+          e.zVals.push(cell.z);
+        }
+      }
+    });
+  });
+
+  const nWires = wires.length;
+  entities.forEach(e => {
+    const n = e.ranks.length;
+    e.avgFinish = n ? e.ranks.reduce((a, b) => a + b, 0) / n : null;
+    const top3 = e.perWire.filter(p => p.compatible && p.rank != null && p.rank <= 3).length;
+    e.top3Count = top3;
+    e.top3Denom = rankMode === 'field' ? nWires : e.nCompat;
+    e.top3Rate = e.top3Denom ? top3 / e.top3Denom : 0;
+    e.meanZ = e.zVals.length ? e.zVals.reduce((a, b) => a + b, 0) / e.zVals.length : null;
+    e.compatMeanRank = (() => {
+      const rs = e.perWire.filter(p => p.compatible).map(p => p.rank);
+      return rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
+    })();
+  });
+
+  const sorted = sortRankingEntities(entities);
+  sorted.forEach((e, i) => { e.place = i + 1; });
+  return { entities: sorted, N, wires, nWires };
+}
+
+function sortRankingEntities(entities) {
+  return [...entities].sort((a, b) => {
+    if (rankMetric === 'top3') {
+      if (b.top3Rate !== a.top3Rate) return b.top3Rate - a.top3Rate;
+      if (a.avgFinish != null && b.avgFinish != null && a.avgFinish !== b.avgFinish) return a.avgFinish - b.avgFinish;
+    } else if (rankMetric === 'zlog') {
+      if (a.meanZ != null && b.meanZ != null && a.meanZ !== b.meanZ) return a.meanZ - b.meanZ;
+    } else if (a.avgFinish != null && b.avgFinish != null && a.avgFinish !== b.avgFinish) {
+      return a.avgFinish - b.avgFinish;
+    }
+    if (b.nCompat !== a.nCompat) return b.nCompat - a.nCompat;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function fmtRank(v) {
+  if (v == null || Number.isNaN(v)) return '—';
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+function fmtPct(v) {
+  return (v * 100).toFixed(0) + '%';
+}
+
+function rankCellColor(rank, N) {
+  if (rank == null) return null;
+  const t = Math.max(0, Math.min(1, (rank - 1) / Math.max(1, N - 1)));
+  const hue = 120 * (1 - t);
+  const light = isDark() ? 38 : 92;
+  const sat = isDark() ? 45 : 55;
+  return `hsl(${hue.toFixed(0)}, ${sat}%, ${light}%)`;
+}
+
+function renderRankings() {
+  const main = $('#mainContent');
+  const result = computeRankings();
+  const kMax = result.N;
+  if (rankShowTopK > kMax) rankShowTopK = kMax;
+  if (rankShowTopK < 1) rankShowTopK = 1;
+
+  const modeSub = rankMode === 'field'
+    ? 'Coverage-aware field utility · Scotchlok and Posi-Tap as families · misses scored as midrank of leftover places'
+    : 'Individual connectors · mean finish only on compatible wires (n ≥ 2) · n/15 is required context';
+
+  main.innerHTML = `
+    <div class="topbar">
+      <div>
+        <div class="page-title">Phase 1 Rankings</div>
+        <div class="page-sub">${modeSub}</div>
+      </div>
+    </div>
+
+    <div class="tabs" id="rankModeTabs">
+      <button class="tab-btn ${rankMode==='field'?'active':''}" data-mode="field">Field utility</button>
+      <button class="tab-btn ${rankMode==='fits'?'active':''}" data-mode="fits">When it fits</button>
+    </div>
+
+    <div class="rank-controls">
+      ${rankMode === 'field' ? `
+      <div class="rank-control-group">
+        <span class="rank-control-label">Family score</span>
+        <div class="chip-row" style="margin:0">
+          <button class="chip ${rankComposite==='mean'?'active':''}" data-comp="mean">Mean of sizes</button>
+          <button class="chip ${rankComposite==='min'?'active':''}" data-comp="min">Best size</button>
+        </div>
+      </div>` : ''}
+      <div class="rank-control-group">
+        <span class="rank-control-label">Sort / metric</span>
+        <div class="chip-row" style="margin:0">
+          <button class="chip ${rankMetric==='avg'?'active':''}" data-metric="avg">Average finish</button>
+          <button class="chip ${rankMetric==='top3'?'active':''}" data-metric="top3">Top-3 rate</button>
+          <button class="chip ${rankMetric==='zlog'?'active':''}" data-metric="zlog">Mean z(log Ω)</button>
+        </div>
+      </div>
+      <div class="rank-control-group rank-slider-group">
+        <label class="rank-control-label" for="rankTopK">Bump chart: top ${rankShowTopK} of ${kMax}</label>
+        <input type="range" id="rankTopK" min="1" max="${kMax}" value="${rankShowTopK}">
+      </div>
+    </div>
+    <p class="rank-hint">Click a table row or chart legend to pin a connector through the bump chart. Pinned lines stay visible even outside the top ${rankShowTopK}.</p>
+
+    <div class="section">
+      <div class="section-title">Finish by wire type</div>
+      <div class="chart-container"><canvas id="rankBumpChart" height="170"></canvas></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Rank heatmap</div>
+      <p class="rank-hint">Green = better (lower rank). Grey = not compatible${rankMode==='field' ? ' (cell shows midrank penalty)' : ''}.</p>
+      <div class="heatmap-scroll"><div id="rankHeatmapWrap"></div></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Coverage vs performance</div>
+      <p class="rank-hint">X is compatible wire types (n ≥ 2). Y is mean rank on those wires only — specialists sit left; broad, good connectors sit lower-right.</p>
+      <div class="chart-container"><canvas id="rankScatterChart" height="110"></canvas></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Leaderboard</div>
+      <div id="rankTableWrap"></div>
+    </div>
+
+    <div class="section methodology-block" id="rankMethodology">
+      <div class="section-title">Ranking methodology</div>
+      ${rankingMethodologyHtml()}
+    </div>
+  `;
+
+  $$('#rankModeTabs .tab-btn').forEach(btn => btn.addEventListener('click', () => {
+    rankMode = btn.dataset.mode;
+    rankPinned = new Set();
+    renderRankings();
+  }));
+  $$('[data-comp]').forEach(btn => btn.addEventListener('click', () => {
+    rankComposite = btn.dataset.comp;
+    renderRankings();
+  }));
+  $$('[data-metric]').forEach(btn => btn.addEventListener('click', () => {
+    rankMetric = btn.dataset.metric;
+    renderRankings();
+  }));
+  const slider = $('#rankTopK');
+  slider.addEventListener('input', () => {
+    rankShowTopK = parseInt(slider.value, 10);
+    const lab = slider.previousElementSibling;
+    if (lab) lab.textContent = `Bump chart: top ${rankShowTopK} of ${kMax}`;
+    drawRankBump(result);
+  });
+
+  renderRankTable(result);
+  renderRankHeatmap(result);
+  drawRankBump(result);
+  drawRankScatter(result);
+}
+
+function rankingMethodologyHtml() {
+  return `
+    <div class="about-content">
+      <p>These rankings use Phase 1 baseline mean resistance only. The question is downselection: which connectors are worth taking into follow-on tests. Each connector is compared <em>within</em> a wire type first, so a 26&nbsp;Ω magnet-wire disaster cannot swamp fifteen other races. n = 1 cells are treated as not compatible (flagged) — a single trial was typically an inability to re-establish a connection, not a replicable mean.</p>
+
+      <h3>Within-wire ranks</h3>
+      <p>On each of the 15 wire types, compatible connectors (n ≥ 2) are ordered by mean resistance, lowest first. Ties at the same reported mean share the <strong>average of the ranks they occupy</strong> (two connectors tied for 2nd and 3rd both get 2.5; the next is 4th).</p>
+
+      <h3>Field utility vs when it fits</h3>
+      <p><strong>Field utility</strong> treats Scotchlok 951/952/953 and Posi-Tap Yellow/Blue/Red as two kit-style families. A family score on a wire is either the mean of the member means that were compatible, or the best member (toggle). Incompatible families and individuals on that wire all receive the same penalty: the <strong>midrank of the leftover places</strong>. If N entities are in the ranking and C of them ran, leftover slots are C+1 through N; each miss gets (C + N + 1) / 2. Example: 17 entities, 3 compatible on 14 AWG silicone — misses get (3+17+1)/2 = 10.5, not 4 (one tick behind last) and not 18 (last of the whole inventory). That still charges for missing a crowded wire, without treating “could not tap a wire almost nobody could tap” as a full last-place bomb. Each entity’s 15 finishes (measured ranks plus any midranks) are averaged. Lower average finish is better.</p>
+      <p><strong>When it fits</strong> ranks every SKU separately, ignores wires it cannot connect, and reports the mean of those compatible-wire ranks plus <strong>n/15</strong>. Mean and sum of ranks would agree only if every connector entered all 15 races; sum would reward sitting out. Manufacturer AWG print is ignored — in use you grab what looks like it fits.</p>
+
+      <h3>Other metrics</h3>
+      <p><strong>Top-3 rate</strong> is how often the entity finished with rank ≤ 3 when it had a usable mean, divided by 15 in field utility (a miss is not a top-3) and by n compatible in when-it-fits. It is a simple downselect signal: connectors that repeatedly land in the top cluster on this matrix are the ones worth advancing, even though each cell is only n = 3 trials.</p>
+      <p><strong>Mean z(log Ω)</strong> uses the gap in resistance, not just order. On each wire, z is (ln(mean Ω) − field mean) / sample SD among compatible connectors. Lower (more negative) is better. Field utility averages z across all 15 wires and assigns misses the worst compatible z on that wire (or +1 if fewer than two ran), so coverage still hurts. When-it-fits averages z only on compatible wires. At very low ohms, CV and DMM floor error can be a large fraction of the reading — first vs second is often not a real gap; average ranks already collapse exact 0.001&nbsp;Ω ties, and this z-score will still agree more on “who is in the good cluster” than on 0.019 vs 0.022.</p>
+
+      <h3>Families</h3>
+      <p>Only Scotchlok and Posi-Tap are composited, and only in field utility. Mean-of-sizes vs best-size answers two EOD-relevant readings: the size you grabbed vs the size you would have picked with a gauge. The test matrix is 14/24/30 AWG only, so neither family score is a claim about 10–12 AWG kit coverage. Hover a heatmap cell for member ohms, trial counts, and CV%.</p>
+    </div>
+  `;
+}
+
+function renderRankTable(result) {
+  const el = $('#rankTableWrap');
+  const nWires = result.nWires;
+  const rows = result.entities.map(e => {
+    const pinned = rankPinned.has(e.key);
+    const n1 = e.perWire.some(p => p.n1dropped);
+    const metricClass = (col) => rankMetric === col ? 'rank-metric-col' : '';
+    return `<tr class="${pinned ? 'rank-pinned-row' : ''}" data-key="${e.key}" title="Click to pin in the bump chart">
+      <td>${e.place}</td>
+      <td>
+        <span class="rank-swatch" style="background:${e.color}"></span>
+        ${e.name}
+        ${e.kind === 'family' ? '<span class="badge badge-partial">family</span>' : ''}
+        ${n1 ? '<span class="badge badge-n1" title="At least one n=1 cell was dropped (treated as not compatible)">n=1 dropped</span>' : ''}
+      </td>
+      <td class="${metricClass('avg')} tabular-nums">${fmtRank(e.avgFinish)}</td>
+      <td class="${metricClass('top3')} tabular-nums">${e.top3Count}/${e.top3Denom} (${fmtPct(e.top3Rate)})</td>
+      <td class="${metricClass('zlog')} tabular-nums">${e.meanZ == null ? '—' : e.meanZ.toFixed(2)}</td>
+      <td class="tabular-nums">${e.nCompat}/${nWires}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `
+    <table class="data-table">
+      <thead><tr>
+        <th>Place</th>
+        <th>Connector</th>
+        <th>Avg finish</th>
+        <th>Top-3</th>
+        <th>Mean z(log Ω)</th>
+        <th>n/${nWires}</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+  $$('#rankTableWrap tbody tr').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const k = tr.dataset.key;
+      if (rankPinned.has(k)) rankPinned.delete(k); else rankPinned.add(k);
+      const result2 = computeRankings();
+      renderRankTable(result2);
+      renderRankHeatmap(result2);
+      drawRankBump(result2);
+      drawRankScatter(result2);
+    });
+  });
+}
+
+function rankCellTitle(entity, cell) {
+  const parts = [DATA.wire_labels[cell.wire]];
+  if (cell.compatible) {
+    parts.push(`Rank ${fmtRank(cell.rank)}`);
+    if (entity.kind === 'family') {
+      cell.members.forEach(m => parts.push(`${m.name}: ${fmtOhm(m.ohm)} (n=${m.n}, ${fmtCV(m.cv)})`));
+      parts.push(`Family ${rankComposite === 'min' ? 'best' : 'mean'}: ${fmtOhm(cell.ohm)}`);
+    } else {
+      const m = cell.members[0];
+      parts.push(`${fmtOhm(cell.ohm)}; ${fmtCV(m.cv)}; n=${m.n}`);
+    }
+  } else {
+    parts.push(rankMode === 'field' ? `Not compatible · midrank ${fmtRank(cell.rank)}` : 'Not compatible');
+    if (cell.n1dropped) parts.push('n=1 trial dropped');
+  }
+  return parts.join(' · ');
+}
+
+function renderRankHeatmap(result) {
+  const wrap = $('#rankHeatmapWrap');
+  const header = result.wires.map(w => `<th class="wire-col-header">${shortWireLabel(w)}</th>`).join('');
+  const body = result.entities.map(e => {
+    const pinned = rankPinned.has(e.key) ? ' rank-pinned-row' : '';
+    const cells = e.perWire.map(cell => {
+      const na = !cell.compatible;
+      const bg = na && rankMode === 'fits' ? '' : rankCellColor(cell.rank, result.N);
+      const flag = cell.n1dropped ? '<span class="hm-n1">n=1</span>' : '';
+      return `<td class="hm-cell ${na ? 'hm-na' : ''}" style="${bg ? `background:${bg}` : ''}" title="${rankCellTitle(e, cell).replace(/"/g,'&quot;')}">
+        <span class="hm-mean">${fmtRank(cell.rank)}</span>
+        ${flag}
+      </td>`;
+    }).join('');
+    return `<tr class="${pinned}" data-key="${e.key}">
+      <td class="connector-name-cell"><span class="rank-swatch" style="background:${e.color}"></span>${e.name}</td>
+      ${cells}
+    </tr>`;
+  }).join('');
+  wrap.innerHTML = `
+    <table class="heatmap-table">
+      <thead><tr><th class="connector-corner">Connector</th>${header}</tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+  `;
+  $$('#rankHeatmapWrap tbody tr').forEach(tr => {
+    tr.addEventListener('click', () => {
+      const k = tr.dataset.key;
+      if (rankPinned.has(k)) rankPinned.delete(k); else rankPinned.add(k);
+      const next = computeRankings();
+      renderRankTable(next);
+      renderRankHeatmap(next);
+      drawRankBump(next);
+      drawRankScatter(next);
+    });
+  });
+}
+
+function visibleBumpKeys(result) {
+  const keys = new Set(result.entities.slice(0, rankShowTopK).map(e => e.key));
+  rankPinned.forEach(k => keys.add(k));
+  return keys;
+}
+
+function drawRankBump(result) {
+  const canvas = $('#rankBumpChart');
+  if (!canvas) return;
+  const existing = charts.filter(c => c.canvas === canvas);
+  existing.forEach(c => { c.destroy(); charts.splice(charts.indexOf(c), 1); });
+
+  const colors = themeColors();
+  const labels = result.wires.map(shortWireTick);
+  const shown = visibleBumpKeys(result);
+  const datasets = result.entities.filter(e => shown.has(e.key)).map(e => {
+    const pinned = rankPinned.has(e.key);
+    const compat = e.perWire.map(p => p.compatible);
+    return {
+      label: e.name,
+      data: e.perWire.map(p => p.rank),
+      borderColor: e.color,
+      backgroundColor: e.color,
+      borderWidth: pinned ? 3 : 2,
+      pointRadius: pinned ? 5 : 3,
+      pointHoverRadius: 6,
+      tension: 0.15,
+      spanGaps: true,
+      segment: {
+        borderDash: (ctx) => {
+          const i = ctx.p0DataIndex;
+          return (compat[i] && compat[i + 1]) ? [] : [5, 4];
+        }
+      }
+    };
+  });
+
+  const chart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      interaction: { mode: 'nearest', intersect: false },
+      plugins: {
+        legend: {
+          labels: { color: colors.text, boxWidth: 12, font: { size: 11 } },
+          onClick: (evt, item, legend) => {
+            const name = legend.chart.data.datasets[item.datasetIndex].label;
+            const ent = result.entities.find(e => e.name === name);
+            if (!ent) return;
+            if (rankPinned.has(ent.key)) rankPinned.delete(ent.key); else rankPinned.add(ent.key);
+            const next = computeRankings();
+            renderRankTable(next);
+            renderRankHeatmap(next);
+            drawRankBump(next);
+            drawRankScatter(next);
+          }
+        },
+        tooltip: {
+          callbacks: {
+            afterBody: (items) => {
+              const item = items[0];
+              const name = item.dataset.label;
+              const ent = result.entities.find(e => e.name === name);
+              if (!ent) return '';
+              const cell = ent.perWire[item.dataIndex];
+              return rankCellTitle(ent, cell);
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { color: colors.muted, maxRotation: 0, minRotation: 0, autoSkip: false, font: { size: 10 } }, grid: { color: colors.grid } },
+        y: {
+          reverse: true,
+          min: 1,
+          max: result.N,
+          ticks: { color: colors.muted, stepSize: 1 },
+          grid: { color: colors.grid },
+          title: { display: true, text: 'Rank (1 = best)', color: colors.muted }
+        }
+      }
+    }
+  });
+  charts.push(chart);
+}
+
+function drawRankScatter(result) {
+  const canvas = $('#rankScatterChart');
+  if (!canvas) return;
+  const existing = charts.filter(c => c.canvas === canvas);
+  existing.forEach(c => { c.destroy(); charts.splice(charts.indexOf(c), 1); });
+  const colors = themeColors();
+  const datasets = result.entities.map(e => ({
+    label: e.name,
+    data: [{ x: e.nCompat, y: e.compatMeanRank, key: e.key }],
+    backgroundColor: e.color,
+    borderColor: rankPinned.has(e.key) ? colors.text : e.color,
+    borderWidth: rankPinned.has(e.key) ? 2 : 1,
+    pointRadius: rankPinned.has(e.key) ? 8 : 6,
+    pointHoverRadius: 9,
+  }));
+
+  const chart = new Chart(canvas.getContext('2d'), {
+    type: 'scatter',
+    data: { datasets },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const e = result.entities.find(x => x.name === ctx.dataset.label);
+              if (!e) return ctx.dataset.label;
+              return `${e.name}: ${e.nCompat}/${result.nWires} wires, mean rank when compatible ${fmtRank(e.compatMeanRank)}`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          min: 0,
+          max: result.nWires,
+          ticks: { color: colors.muted, stepSize: 1 },
+          grid: { color: colors.grid },
+          title: { display: true, text: 'Compatible wire types (n ≥ 2)', color: colors.muted }
+        },
+        y: {
+          reverse: true,
+          min: 1,
+          ticks: { color: colors.muted },
+          grid: { color: colors.grid },
+          title: { display: true, text: 'Mean rank on compatible wires', color: colors.muted }
+        }
+      },
+      onClick: (evt, els, ch) => {
+        if (!els.length) return;
+        const ds = ch.data.datasets[els[0].datasetIndex];
+        const ent = result.entities.find(e => e.name === ds.label);
+        if (!ent) return;
+        if (rankPinned.has(ent.key)) rankPinned.delete(ent.key); else rankPinned.add(ent.key);
+        const next = computeRankings();
+        renderRankTable(next);
+        renderRankHeatmap(next);
+        drawRankBump(next);
+        drawRankScatter(next);
+      }
+    }
+  });
+  charts.push(chart);
+}
+
+// ============================================================
 // VIEW: About
 // ============================================================
 function renderAbout() {
@@ -899,6 +1502,9 @@ function renderAbout() {
 
       <h3>Phase 1 Matrix</h3>
       <p>A single scrollable table showing every connector (rows) against every wire type (columns) for Phase 1 baseline data — mean resistance and CV% per cell, colored using the same coverage gradient. Click any wire-type column header to sort all connectors by that wire's mean resistance (ascending, then descending, then back to alphabetical).</p>
+
+      <h3>Phase 1 Rankings</h3>
+      <p>The Rankings view collapses the Phase 1 matrix into two leaderboards (coverage-aware field utility with Scotchlok/Posi-Tap families, and a when-it-fits list of individual SKUs), plus a bump chart, rank heatmap, and coverage scatter. Full rules — average ranks for ties, midrank-of-leftover-places for misses, n = 1 dropped, and the z(log Ω) / top-3 variants — are on that page under Ranking methodology.</p>
 
       <h3>Data Corrections Applied</h3>
       <p>Four Phase 3 readings flagged as likely decimal-point transcription errors (roughly 5–15x off from the paired immediate/dwell reading) were corrected after manual review: WASPP / 30 AWG Magnet Wire, Fluke Networks MT-8203-20 Intellitone / 14 AWG Silicone Stranded, 3M Scotchlok 951 / 14 AWG PVC Stranded, and Posi-Tap Yellow / 14 AWG PVC Stranded.</p>
