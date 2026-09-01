@@ -267,3 +267,23 @@ table.heatmap-table td.hm-cell .hm-cv { font-size: 10px; opacity: 0.85; display:
 table.heatmap-table td.hm-cell.hm-na { color: var(--color-text-faint); background: var(--color-surface-offset); }
 table.heatmap-table tr:nth-child(even) td.connector-name-cell { background: var(--color-surface-2); }
 .heatmap-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--space-4); flex-wrap: wrap; gap: var(--space-3); }
+
+/* Rankings view */
+.rank-controls {
+  display: flex; flex-wrap: wrap; gap: var(--space-5); align-items: flex-end;
+  margin-bottom: var(--space-4);
+}
+.rank-control-group { display: flex; flex-direction: column; gap: var(--space-2); }
+.rank-control-label { font-size: var(--text-xs); font-weight: 600; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
+.rank-slider-group { min-width: 220px; flex: 1; }
+.rank-slider-group input[type="range"] { width: 100%; accent-color: var(--color-primary); }
+.rank-hint { font-size: var(--text-xs); color: var(--color-text-muted); margin: calc(var(--space-2) * -1) 0 var(--space-3); }
+.rank-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.rank-pinned-row td { box-shadow: inset 3px 0 0 var(--color-primary); }
+td.rank-metric-col, th.rank-metric-col { font-weight: 700; }
+.badge-n1 { background: var(--color-warning-highlight); color: var(--color-warning); margin-left: 6px; }
+.hm-n1 { display: block; font-size: 9px; color: var(--color-warning); margin-top: 2px; }
+.methodology-block {
+  border-top: 1px solid var(--color-divider); padding-top: var(--space-8); margin-top: var(--space-10);
+}
+.methodology-block .about-content { max-width: 76ch; }
